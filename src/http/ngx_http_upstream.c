@@ -52,7 +52,8 @@ static ngx_int_t ngx_http_upstream_test_next(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 static ngx_int_t ngx_http_upstream_intercept_errors(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
-static ngx_int_t ngx_http_upstream_test_connect(ngx_connection_t *c);
+static ngx_int_t ngx_http_upstream_test_connect(ngx_http_upstream_t *u,
+    ngx_connection_t *c);
 static ngx_int_t ngx_http_upstream_process_headers(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 static void ngx_http_upstream_process_body_in_memory(ngx_http_request_t *r,
@@ -184,6 +185,11 @@ static void ngx_http_upstream_ssl_init_connection(ngx_http_request_t *,
     ngx_http_upstream_t *u, ngx_connection_t *c);
 static void ngx_http_upstream_ssl_handshake(ngx_connection_t *c);
 static ngx_int_t ngx_http_upstream_ssl_name(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_connection_t *c);
+#endif
+
+#if (NGX_HTTP_V2)
+static ngx_int_t ngx_http_upstream_v2_init_connection(ngx_http_request_t *,
     ngx_http_upstream_t *u, ngx_connection_t *c);
 #endif
 
@@ -1515,6 +1521,18 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
     c = u->peer.connection;
 
+#if (NGX_HTTP_V2)
+
+    if (u->http2 && c->http2) {
+        if (ngx_http_upstream_v2_init_connection(r, u, c) != NGX_OK) {
+            return;
+        }
+
+        c = u->peer.connection;
+    }
+
+#endif
+
     c->data = r;
 
     c->write->handler = ngx_http_upstream_handler;
@@ -1538,10 +1556,15 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
         }
     }
 
-    c->log = r->connection->log;
-    c->pool->log = c->log;
-    c->read->log = c->log;
-    c->write->log = c->log;
+#if (NGX_HTTP_V2)
+    if (u->stream == NULL)
+#endif
+    {
+        c->log = r->connection->log;
+        c->pool->log = c->log;
+        c->read->log = c->log;
+        c->write->log = c->log;
+    }
 
     /* init or reinit the ngx_output_chain() and ngx_chain_writer() contexts */
 
@@ -1601,6 +1624,16 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
 #endif
 
+#if (NGX_HTTP_V2)
+
+    if (u->http2 && u->stream == NULL) {
+        if (ngx_http_upstream_v2_init_connection(r, u, c) != NGX_OK) {
+            return;
+        }
+    }
+
+#endif
+
     ngx_http_upstream_send_request(r, u, 1);
 }
 
@@ -1614,7 +1647,7 @@ ngx_http_upstream_ssl_init_connection(ngx_http_request_t *r,
     ngx_int_t                  rc;
     ngx_http_core_loc_conf_t  *clcf;
 
-    if (ngx_http_upstream_test_connect(c) != NGX_OK) {
+    if (ngx_http_upstream_test_connect(u, c) != NGX_OK) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
         return;
     }
@@ -1713,6 +1746,16 @@ ngx_http_upstream_ssl_handshake(ngx_connection_t *c)
 
         c->write->handler = ngx_http_upstream_handler;
         c->read->handler = ngx_http_upstream_handler;
+
+#if (NGX_HTTP_V2)
+
+        if (u->http2 && u->stream == NULL) {
+            if (ngx_http_upstream_v2_init_connection(r, u, c) != NGX_OK) {
+                return;
+            }
+        }
+
+#endif
 
         c = r->connection;
 
@@ -1835,6 +1878,51 @@ done:
 #endif
 
 
+#if (NGX_HTTP_V2)
+
+static ngx_int_t
+ngx_http_upstream_v2_init_connection(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_connection_t *c)
+{
+    ngx_connection_t          *fc;
+    ngx_http_v2_connection_t  *h2c;
+
+    if (ngx_http_upstream_test_connect(u, c) != NGX_OK) {
+        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+        return NGX_ERROR;
+    }
+
+    c->sendfile = 0;
+    u->output.sendfile = 0;
+
+    h2c = ngx_http_v2_init_connection(c, r->http_connection, 0);
+    if (h2c == NULL) {
+        ngx_http_upstream_finalize_request(r, u,
+                                           NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_ERROR;
+    }
+
+    u->stream = ngx_http_v2_create_stream(h2c, r);
+    if (u->stream == NULL) {
+        ngx_http_upstream_finalize_request(r, u,
+                                           NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_ERROR;
+    }
+
+    fc = u->stream->fake_connection;
+
+    fc->write->handler = ngx_http_upstream_handler;
+    fc->read->handler = ngx_http_upstream_handler;
+
+    u->writer.connection = fc;
+    u->peer.connection = fc;
+
+    return NGX_OK;
+}
+
+#endif
+
+
 static ngx_int_t
 ngx_http_upstream_reinit(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -1929,7 +2017,7 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
         u->state->connect_time = ngx_current_msec - u->state->response_time;
     }
 
-    if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
+    if (!u->request_sent && ngx_http_upstream_test_connect(u, c) != NGX_OK) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
         return;
     }
@@ -2131,6 +2219,16 @@ ngx_http_upstream_send_request_handler(ngx_http_request_t *r,
 
 #endif
 
+#if (NGX_HTTP_V2)
+
+    if (u->http2 && u->stream == NULL) {
+        if (ngx_http_upstream_v2_init_connection(r, u, c) != NGX_OK) {
+            return;
+        }
+    }
+
+#endif
+
     if (u->header_sent) {
         u->write_event_handler = ngx_http_upstream_dummy_handler;
 
@@ -2184,10 +2282,33 @@ ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
         return;
     }
 
-    if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
+    if (!u->request_sent && ngx_http_upstream_test_connect(u, c) != NGX_OK) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
         return;
     }
+
+#if (NGX_HTTP_V2)
+
+    if (u->stream) {
+        rc = (u->headers_in.status_n >= NGX_HTTP_OK)
+             ? NGX_OK : NGX_HTTP_UPSTREAM_INVALID_HEADER;
+
+        goto done;
+
+    } else if (u->http2 && !u->request_sent) {
+
+        /* early SETTINGS on the real HTTP/2 connection */
+
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            ngx_http_upstream_finalize_request(r, u,
+                                               NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        return;
+    }
+
+#endif
 
     if (u->buffer.start == NULL) {
         u->buffer.start = ngx_palloc(r->pool, u->conf->buffer_size);
@@ -2279,6 +2400,12 @@ ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
         break;
     }
 
+#if (NGX_HTTP_V2)
+
+done:
+
+#endif
+
     if (rc == NGX_HTTP_UPSTREAM_INVALID_HEADER) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_INVALID_HEADER);
         return;
@@ -2308,6 +2435,36 @@ ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
     if (ngx_http_upstream_process_headers(r, u) != NGX_OK) {
         return;
     }
+
+#if (NGX_HTTP_V2)
+
+    if (u->buffer.start == NULL && u->stream) {
+        u->buffer.start = ngx_palloc(r->pool, u->conf->buffer_size);
+        if (u->buffer.start == NULL) {
+            ngx_http_upstream_finalize_request(r, u,
+                                               NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        u->buffer.pos = u->buffer.start;
+        u->buffer.last = u->buffer.start;
+        u->buffer.end = u->buffer.start + u->conf->buffer_size;
+        u->buffer.temporary = 1;
+
+        u->buffer.tag = u->output.tag;
+
+#if (NGX_HTTP_CACHE)
+
+        if (r->cache) {
+            u->buffer.pos += r->cache->header_start;
+            u->buffer.last = u->buffer.pos;
+        }
+
+#endif
+
+    }
+
+#endif
 
     if (!r->subrequest_in_memory) {
         ngx_http_upstream_send_response(r, u);
@@ -2527,10 +2684,18 @@ ngx_http_upstream_intercept_errors(ngx_http_request_t *r,
 
 
 static ngx_int_t
-ngx_http_upstream_test_connect(ngx_connection_t *c)
+ngx_http_upstream_test_connect(ngx_http_upstream_t *u, ngx_connection_t *c)
 {
     int        err;
     socklen_t  len;
+
+#if (NGX_HTTP_V2)
+
+    if (u->stream) {
+        return NGX_OK;
+    }
+
+#endif
 
 #if (NGX_HAVE_KQUEUE)
 
@@ -4027,6 +4192,14 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http next upstream, %xi", ft_type);
 
+#if (NGX_HTTP_V2)
+
+    if (u->stream) {
+        ngx_http_v2_upstream_free_stream(r, u);
+    }
+
+#endif
+
     if (u->peer.sockaddr) {
 
         if (ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_403
@@ -4199,6 +4372,14 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     }
 
     u->finalize_request(r, rc);
+
+#if (NGX_HTTP_V2)
+
+    if (u->stream) {
+        ngx_http_v2_upstream_free_stream(r, u);
+    }
+
+#endif
 
     if (u->peer.free && u->peer.sockaddr) {
         u->peer.free(&u->peer, u->peer.data, 0);
